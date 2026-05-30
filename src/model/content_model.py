@@ -5,7 +5,10 @@ and cosine similarity to find similar items.
 
 Optimizations:
 - Implements chunked batch encoding to prevent Out-Of-Memory (OOM) memory overhead.
+- Implements efficient O(N log K) top-K partial partitioning via np.argpartition.
+- Implements O(N) time, O(K) space Reservoir Sampling for uniform exploration.
 """
+import random
 import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
@@ -42,7 +45,7 @@ class ContentRecommender:
     def recommend(self, title, top_n=10, target_catalog=None):
         """
         Get content-based recommendations for a given item title.
-        Returns list of dicts: [{ 'title', 'content_score' }, ...]
+        Optimized via O(N log K) partial sorting partition networks.
         """
         if title.lower() not in self._title_to_idx:
             return []
@@ -51,12 +54,21 @@ class ContentRecommender:
         query_vec = self.matrix[idx].reshape(1, -1)
         scores = cosine_similarity(query_vec, self.matrix).flatten()
         
-        sim_scores = list(enumerate(scores))
-        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+        # Request a larger buffer partition multiplier to account for matching duplicates or self-filters
+        buffer_k = min(len(scores), top_n * 4)
+        
+        if len(scores) <= buffer_k:
+            candidate_indices = np.argsort(scores)[::-1]
+        else:
+            partition_idx = len(scores) - buffer_k
+            raw_partition = np.argpartition(scores, partition_idx)
+            top_k_unsorted = raw_partition[partition_idx:]
+            candidate_indices = top_k_unsorted[np.argsort(scores[top_k_unsorted])[::-1]]
 
         results = []
         seen = set()
-        for i, score in sim_scores:
+        for i in candidate_indices:
+            score = scores[i]
             t = self.df.iloc[i]['title']
             if t.lower() == title.lower() or t in seen:
                 continue
@@ -75,6 +87,47 @@ class ContentRecommender:
             if len(results) >= top_n:
                 break
 
+        return results
+
+    def recommend_random_exploration(self, top_n: int = 10) -> list:
+        """
+        Selects top_n random items uniformly from the dataset catalog.
+        
+        OPTIMIZATION LAYER: O(N) Reservoir Sampling Network (#882)
+        - Replaces heavy global shuffling loops to protect host memory.
+        - Limits streaming memory overhead strictly to an O(K) space footprint.
+        """
+        if self.df is None or self.df.empty:
+            return []
+            
+        total_items = len(self.df)
+        
+        # If the catalog contains fewer items than requested, return everything safely
+        if total_items <= top_n:
+            sampled_indices = list(range(total_items))
+        else:
+            # 1. Initialize reservoir pool with the first top_n item indices
+            sampled_indices = list(range(top_n))
+            
+            # 2. Iterate through the remaining dataset streams using probability thresholds
+            for i in range(top_n, total_items):
+                j = random.randint(0, i)
+                if j < top_n:
+                    sampled_indices[j] = i
+                    
+        # Extract the sampled rows from the master DataFrame allocation
+        sampled_slice = self.df.iloc[sampled_indices]
+
+        # Format rows cleanly to match the unified API schema footprints
+        results = []
+        for _, row in sampled_slice.iterrows():
+            results.append({
+                'title': row.get('title', 'Unknown Title'),
+                'category': row.get('category', 'Exploration'),
+                'item_id': str(row.get('item_id', '')),
+                'exploration_score': 1.0,
+            })
+            
         return results
 
     def explain_similarity(self, source_title, candidate_title, top_n=5):
@@ -98,13 +151,20 @@ class ContentRecommender:
     def search(self, query, top_n=20, target_catalog=None):
         """
         Search items by query text using semantic similarity.
-        Returns list of matching item titles with scores.
+        Optimized via O(N log K) partial sorting partition networks.
         """
         query_vec = self.model.encode([query])
         scores = cosine_similarity(query_vec, self.matrix).flatten()
         
-        # Determine candidate indices matching similarity threshold or top N
-        top_indices = scores.argsort()[::-1]
+        buffer_k = min(len(scores), top_n * 4)
+        
+        if len(scores) <= buffer_k:
+            top_indices = np.argsort(scores)[::-1]
+        else:
+            partition_idx = len(scores) - buffer_k
+            raw_partition = np.argpartition(scores, partition_idx)
+            top_k_unsorted = raw_partition[partition_idx:]
+            top_indices = top_k_unsorted[np.argsort(scores[top_k_unsorted])[::-1]]
 
         results = []
         seen = set()
@@ -137,4 +197,3 @@ class ContentRecommender:
             if len(results) >= top_n:
                 break
         return results
-

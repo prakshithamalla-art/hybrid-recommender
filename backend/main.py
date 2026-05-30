@@ -1,3 +1,8 @@
+import os
+from dotenv import load_dotenv
+
+# Load localized environment configurations right at initial boot
+load_dotenv()
 from __future__ import annotations
 
 """
